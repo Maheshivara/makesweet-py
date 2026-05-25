@@ -256,7 +256,7 @@ class Render:
             dark[..., 2] + ((light[..., 2] - dark[..., 2]) * sampled[..., 2]) / 255.0
         )
         result_a = sampled[..., 3]
-        result_a = np.minimum(result_a, dark[..., 3])
+        result_a = np.maximum(result_a, light[..., 3])
 
         out = self.out_arr.astype(np.int32)
         ys_idx, xs_idx = np.where(use_mask)
@@ -267,7 +267,7 @@ class Render:
             rr = int(result_r[yy_i, xx_i])
             rg = int(result_g[yy_i, xx_i])
             rb = int(result_b[yy_i, xx_i])
-            out_r, out_g, out_b, out_a = out[yy_i, xx_i]
+            out_r, out_g, out_b, _ = out[yy_i, xx_i]
             if ra > 250:
                 out[yy_i, xx_i, 0] = rr
                 out[yy_i, xx_i, 1] = rg
