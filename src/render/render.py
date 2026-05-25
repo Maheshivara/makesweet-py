@@ -1,9 +1,9 @@
 from PIL import Image
+import cv2
+import numpy as np
 from typing import List
-from math import sqrt
 from enum import Enum
 
-from render.pixer import Pixer
 from reader.template import Template, Frame
 from reader.input import Input
 from constants.constants import RR
@@ -32,98 +32,61 @@ class Render:
         self.logger = logger if logger is not None else Logger()
 
         self.mapping: Frame | None = None
-        self.out: Image.Image | None = None
+        # internal numpy RGBA arrays for speed
+        self.out_arr: np.ndarray | None = None
+        self.map1_arr: np.ndarray | None = None
+        self.map2_arr: np.ndarray | None = None
+        self.light_arr: np.ndarray | None = None
+        self.dark_arr: np.ndarray | None = None
+        self.neutral_arr: np.ndarray | None = None
+        self.off: int = 0
 
     def _clamp_int(self, v: int, a: int, b: int) -> int:
         return max(a, min(b, int(v)))
 
-    def _get_pixel(self, img: Image.Image, x: int, y: int):
-        w, h = img.size
+    def _to_rgba_arr(self, img: Image.Image) -> np.ndarray:
+        if img.mode != "RGBA":
+            img = img.convert("RGBA")
+        return np.array(img, dtype=np.uint8)
+
+    def _array_get(self, arr: np.ndarray, x: int, y: int):
+        h, w = arr.shape[:2]
         if 0 <= x < w and 0 <= y < h:
-            px = img.getpixel((x, y))
-            if not isinstance(px, tuple) or len(px) != 4:
+            px = arr[y, x]
+            if px.shape[0] != 4:
                 raise ValueError(
-                    f"Expected RGBA pixel, got {px} at ({x}, {y}) in image of size {img.size}"
+                    f"Expected RGBA pixel, got shape {px.shape} at ({x}, {y})"
                 )
-            return px
+            return tuple(int(v) for v in px.tolist())
         else:
             self.logger.debug(
-                f"Attempted to access pixel out of bounds at ({x}, {y}) in image of size {img.size}"
+                f"Attempted to access pixel out of bounds at ({x}, {y}) in array of size {(w, h)}"
             )
             return (0, 0, 0, 0)
 
-    def _get_pixel_from_pixel_access(
-        self, pix_access: Image.core.PixelAccess, x: int, y: int
-    ):
-        px = pix_access[x, y]
-        if not isinstance(px, tuple) or len(px) != 4:
-            raise ValueError(f"Expected RGBA pixel, got {px} at ({x}, {y})")
-        return px
-
-    def _safe_pixel(self, img: Image.Image, x: int, y: int):
-        w, h = img.size
+    def _safe_arr_pixel(self, arr: np.ndarray, x: int, y: int):
+        h, w = arr.shape[:2]
         x = self._clamp_int(x, 0, w - 1)
         y = self._clamp_int(y, 0, h - 1)
-        px = self._get_pixel(img, x, y)
-        return px
+        return tuple(int(v) for v in arr[y, x].tolist())
 
-    def _sample_linear(self, img: Image.Image, x: float, y: float) -> Pixer:
-        if img.mode != "RGBA":
-            img = img.convert("RGBA")
-        xi = int(x)
-        yi = int(y)
-        fx = x - xi
-        fy = y - yi
-
-        p00 = self._safe_pixel(img, xi, yi)
-        p01 = self._safe_pixel(img, xi, yi + 1)
-        p10 = self._safe_pixel(img, xi + 1, yi)
-        p11 = self._safe_pixel(img, xi + 1, yi + 1)
-
-        a00 = p00[3]
-        a10 = p10[3]
-        a01 = p01[3]
-        a11 = p11[3]
-        aa = (
-            (1 - fx) * (1 - fy) * a00
-            + fx * (1 - fy) * a10
-            + (1 - fx) * fy * a01
-            + fx * fy * a11
+    def _remap_sample(
+        self,
+        in_arr: np.ndarray,
+        map_x: np.ndarray,
+        map_y: np.ndarray,
+        interp=cv2.INTER_LINEAR,
+    ) -> np.ndarray:
+        # use replicate border to mimic clamping behavior
+        return cv2.remap(
+            in_arr,
+            map_x.astype(np.float32),
+            map_y.astype(np.float32),
+            interpolation=interp,
+            borderMode=cv2.BORDER_REPLICATE,
         )
-        if aa < 0.0001:
-            aa = 0.0001
-
-        r = (
-            (1 - fx) * (1 - fy) * p00[0] * a00
-            + fx * (1 - fy) * p10[0] * a10
-            + (1 - fx) * fy * p01[0] * a01
-            + fx * fy * p11[0] * a11
-        ) / aa
-        g = (
-            (1 - fx) * (1 - fy) * p00[1] * a00
-            + fx * (1 - fy) * p10[1] * a10
-            + (1 - fx) * fy * p01[1] * a01
-            + fx * fy * p11[1] * a11
-        ) / aa
-        b = (
-            (1 - fx) * (1 - fy) * p00[2] * a00
-            + fx * (1 - fy) * p10[2] * a10
-            + (1 - fx) * fy * p01[2] * a01
-            + fx * fy * p11[2] * a11
-        ) / aa
-        a = (
-            (1 - fx) * (1 - fy) * a00
-            + fx * (1 - fy) * a10
-            + (1 - fx) * fy * a01
-            + fx * fy * a11
-        )
-
-        return Pixer(r, g, b, a)
 
     def _prepare_input_state(self, inp: Input):
-        # derive fields from the Python Input object (maps to C++ Input fields)
-        # because i just doesn't understand how in the hells this work
-        # (aka needed to copy and paste the math from original code)
         xs = float(inp.scale[0])
         ys = float(inp.scale[1])
         xa = float(inp.angle_cos)
@@ -149,65 +112,85 @@ class Render:
         mapping = template.frames[frame_index]
         self.mapping = mapping
         w, h = mapping.light_data.size
+        # prepare numpy arrays
+        self.map1_arr = self._to_rgba_arr(mapping.map1_data)
+        self.map2_arr = self._to_rgba_arr(mapping.map2_data)
+        self.light_arr = self._to_rgba_arr(mapping.light_data)
+        self.dark_arr = self._to_rgba_arr(mapping.dark_data)
+        self.neutral_arr = (
+            self._to_rgba_arr(mapping.neutral_data)
+            if mapping.neutral_data is not None
+            else None
+        )
+        self.off = (self.map2_arr.shape[0] - self.light_arr.shape[0]) // 2
         if mapping.neutral_data is not None:
-            self.out = mapping.neutral_data.copy().convert("RGBA")
+            self.out_arr = self._to_rgba_arr(mapping.neutral_data.copy())
         else:
-            self.out = Image.new("RGBA", (w, h), (255, 255, 255, 0))
+            self.out_arr = np.zeros((h, w, 4), dtype=np.uint8)
+            self.out_arr[..., :3] = 255
+            self.out_arr[..., 3] = 0
 
     def post(self):
-        if self.out is None or self.mapping is None:
+        if self.out_arr is None or self.mapping is None:
             return
-        pre = self.out.copy()
-        w, h = self.out.size
-        map2 = self.mapping.map2_data
-        if map2.size != self.out.size:
+        pre = self.out_arr.copy()
+        h, w = self.out_arr.shape[:2]
+        map2 = self.map2_arr
+        if map2 is None:
+            self.logger.debug("map2_arr is None in post(), skipping post-processing")
+            return
+        if map2.shape[1] != w or map2.shape[0] != h:
             self.logger.debug(
-                f"map2 size {map2.size} differs from output size {self.out.size}, cropping map2 to match"
+                f"map2 size {(map2.shape[1], map2.shape[0])} differs from output size {(w, h)}, cropping map2 to match"
             )
-            map2 = map2.crop((0, 0, w, h)).convert("RGBA")
-        pre_pix = pre.load()
-        out_pix = self.out.load()
-        map2_pix = map2.load()
-        if map2_pix is None or pre_pix is None or out_pix is None:
-            raise ValueError("Failed to load pixel data for post-processing")
-        for y in range(h):
-            for x in range(w):
-                sel = self._get_pixel_from_pixel_access(map2_pix, x, y)
-                if sel[2] > 0:
-                    if 0 < x < w - 1 and 0 < y < h - 1:
-                        total = Pixer(0.0, 0.0, 0.0, 0.0)
-                        ct = 0
-                        # left
-                        idx1 = self._get_pixel_from_pixel_access(map2_pix, x - 1, y)
-                        if idx1[2] < 127:
-                            p = self._get_pixel_from_pixel_access(pre_pix, x - 1, y)
-                            total = total + Pixer(p[0], p[1], p[2], p[3])
-                            ct += 1
-                        # right
-                        idx2 = self._get_pixel_from_pixel_access(map2_pix, x + 1, y)
-                        if idx2[2] < 127:
-                            p = self._get_pixel_from_pixel_access(pre_pix, x + 1, y)
-                            total = total + Pixer(p[0], p[1], p[2], p[3])
-                            ct += 1
-                        # up
-                        idx3 = self._get_pixel_from_pixel_access(map2_pix, x, y - 1)
-                        if idx3[2] < 127:
-                            p = self._get_pixel_from_pixel_access(pre_pix, x, y - 1)
-                            total = total + Pixer(p[0], p[1], p[2], p[3])
-                            ct += 1
-                        # down
-                        idx4 = self._get_pixel_from_pixel_access(map2_pix, x, y + 1)
-                        if idx4[2] < 127:
-                            p = self._get_pixel_from_pixel_access(pre_pix, x, y + 1)
-                            total = total + Pixer(p[0], p[1], p[2], p[3])
-                            ct += 1
-                        if ct > 0.5:
-                            avg = total / ct
-                            out_a = self._get_pixel_from_pixel_access(out_pix, x, y)[3]
-                            out_pix[x, y] = (int(avg.r), int(avg.g), int(avg.b), out_a)
+            map2_crop = map2[0:h, 0:w, :]
+        else:
+            map2_crop = map2
+
+        if h <= 2 or w <= 2:
+            return
+
+        center = map2_crop[1:-1, 1:-1, :]
+        left = map2_crop[1:-1, 0:-2, :]
+        right = map2_crop[1:-1, 2:, :]
+        up = map2_crop[0:-2, 1:-1, :]
+        down = map2_crop[2:, 1:-1, :]
+
+        mask_left = left[..., 2] < 127
+        mask_right = right[..., 2] < 127
+        mask_up = up[..., 2] < 127
+        mask_down = down[..., 2] < 127
+
+        sum_rgba = np.zeros(center.shape, dtype=np.float64)
+        cnt = np.zeros(center.shape[:2], dtype=np.int32)
+
+        if mask_left.any():
+            sum_rgba[mask_left] += pre[1:-1, 0:-2][mask_left].astype(np.float64)
+            cnt[mask_left] += 1
+        if mask_right.any():
+            sum_rgba[mask_right] += pre[1:-1, 2:][mask_right].astype(np.float64)
+            cnt[mask_right] += 1
+        if mask_up.any():
+            sum_rgba[mask_up] += pre[0:-2, 1:-1][mask_up].astype(np.float64)
+            cnt[mask_up] += 1
+        if mask_down.any():
+            sum_rgba[mask_down] += pre[2:, 1:-1][mask_down].astype(np.float64)
+            cnt[mask_down] += 1
+
+        valid = cnt > 0
+        center_sel = center[..., 2] > 0
+        apply_mask = valid & center_sel
+        if apply_mask.any():
+            avg = np.zeros_like(sum_rgba)
+            avg[apply_mask] = sum_rgba[apply_mask] / cnt[apply_mask][..., None]
+            rows, cols = np.where(apply_mask)
+            for ry, rx in zip(rows, cols):
+                self.out_arr[ry + 1, rx + 1, 0:3] = np.clip(
+                    avg[ry, rx, 0:3], 0, 255
+                ).astype(np.uint8)
 
     def add_simple(self, inp: Input):
-        if self.out is None or self.mapping is None:
+        if self.out_arr is None or self.mapping is None:
             self.logger.warning(
                 "add_simple called before pre() or with invalid mapping, skipping"
             )
@@ -221,75 +204,88 @@ class Render:
 
         st = self._prepare_input_state(inp)
         active_scale = st["in_scale"] / 2.0
-        off = (mapping.map2_data.size[1] - mapping.light_data.size[1]) // 2
+        off = self.off
 
-        out_pix = self.out.load()
-        map1_pix = mapping.map1_data.load()
-        map2_pix = mapping.map2_data.load()
-        light_pix = mapping.light_data.load()
-        dark_pix = mapping.dark_data.load()
-        in_img = inp.image.convert("RGBA")
         if (
-            map1_pix is None
-            or map2_pix is None
-            or light_pix is None
-            or dark_pix is None
-            or out_pix is None
+            self.map1_arr is None
+            or self.map2_arr is None
+            or self.light_arr is None
+            or self.dark_arr is None
+            or self.out_arr is None
         ):
             self.logger.panic("Failed to load pixel data for add_simple")
             raise ValueError("Failed to load pixel data for add_simple")
 
-        w, h = mapping.light_data.size
-        for y in range(h):
-            for x in range(w):
-                map_pixel = self._get_pixel_from_pixel_access(map1_pix, x, y + off)
-                sel_pixel = self._get_pixel_from_pixel_access(map2_pix, x, y + off)
-                mod = map_pixel[2]
-                ymod = mod // 16
-                xmod = mod % 16
-                act = map_pixel[3]
-                x1 = map_pixel[0] + 256 * xmod - RR
-                y1 = map_pixel[1] + 256 * ymod - RR
-                x1 *= st["xs"]
-                y1 *= st["ys"]
-                xx = st["xa"] * x1 + st["ya"] * y1
-                yy = -st["ya"] * x1 + st["xa"] * y1
-                xx += RR + st["xo"]
-                yy += RR + st["yo"]
-                xx = st["in_x0"] + active_scale * xx / RR
-                yy = st["in_y0"] + active_scale * yy / RR
+        h, w = self.light_arr.shape[:2]
+        mp = self.map1_arr[off : off + h, 0:w, :].astype(np.int32)
+        sel = self.map2_arr[off : off + h, 0:w, :].astype(np.int32)
+        light = self.light_arr.astype(np.int32)
+        dark = self.dark_arr.astype(np.int32)
+        in_arr = self._to_rgba_arr(inp.image)
 
-                m = self._safe_pixel(in_img, int(xx), int(yy))
-                d = sel_pixel[0] == inp.layer
-                if d and act > 25:
-                    light_pixel = self._get_pixel_from_pixel_access(light_pix, x, y)
-                    dark_pixel = self._get_pixel_from_pixel_access(dark_pix, x, y)
-                    result_r = int(
-                        dark_pixel[0] + ((light_pixel[0] - dark_pixel[0]) * m[0]) / 255
-                    )
-                    result_g = int(
-                        dark_pixel[1] + ((light_pixel[1] - dark_pixel[1]) * m[1]) / 255
-                    )
-                    result_b = int(
-                        dark_pixel[2] + ((light_pixel[2] - dark_pixel[2]) * m[2]) / 255
-                    )
-                    result_a = m[3]
-                    if dark_pixel[3] < result_a:
-                        result_a = dark_pixel[3]
-                    if result_a > 0:
-                        out_r, out_g, out_b, out_a = self._get_pixel_from_pixel_access(
-                            out_pix, x, y
-                        )
-                        if result_a > 250:
-                            out_pix[x, y] = (result_r, result_g, result_b, out_a)
-                        else:
-                            nr = int(out_r + ((result_r - out_r) * result_a) / 255.0)
-                            ng = int(out_g + ((result_g - out_g) * result_a) / 255.0)
-                            nb = int(out_b + ((result_b - out_b) * result_a) / 255.0)
-                            out_pix[x, y] = (nr, ng, nb, out_a)
+        mod = mp[..., 2].astype(np.int32)
+        ymod = mod // 16
+        xmod = mod % 16
+        x1 = (mp[..., 0].astype(np.int32) + 256 * xmod - RR).astype(np.float64)
+        y1 = (mp[..., 1].astype(np.int32) + 256 * ymod - RR).astype(np.float64)
+        x1 *= st["xs"]
+        y1 *= st["ys"]
+        xx = st["xa"] * x1 + st["ya"] * y1
+        yy = -st["ya"] * x1 + st["xa"] * y1
+        xx += RR + st["xo"]
+        yy += RR + st["yo"]
+        xx = st["in_x0"] + active_scale * xx / RR
+        yy = st["in_y0"] + active_scale * yy / RR
+
+        map_x = xx.astype(np.float32)
+        map_y = yy.astype(np.float32)
+        sampled = self._remap_sample(
+            in_arr, map_x, map_y, interp=cv2.INTER_NEAREST
+        ).astype(np.int32)
+
+        d_mask = sel[..., 0] == inp.layer
+        act_mask = mp[..., 3] > 25
+        use_mask = d_mask & act_mask
+        if not use_mask.any():
+            return
+
+        result_r = (
+            dark[..., 0] + ((light[..., 0] - dark[..., 0]) * sampled[..., 0]) / 255.0
+        )
+        result_g = (
+            dark[..., 1] + ((light[..., 1] - dark[..., 1]) * sampled[..., 1]) / 255.0
+        )
+        result_b = (
+            dark[..., 2] + ((light[..., 2] - dark[..., 2]) * sampled[..., 2]) / 255.0
+        )
+        result_a = sampled[..., 3]
+        result_a = np.minimum(result_a, dark[..., 3])
+
+        out = self.out_arr.astype(np.int32)
+        ys_idx, xs_idx = np.where(use_mask)
+        for yy_i, xx_i in zip(ys_idx, xs_idx):
+            ra = int(result_a[yy_i, xx_i])
+            if ra <= 0:
+                continue
+            rr = int(result_r[yy_i, xx_i])
+            rg = int(result_g[yy_i, xx_i])
+            rb = int(result_b[yy_i, xx_i])
+            out_r, out_g, out_b, out_a = out[yy_i, xx_i]
+            if ra > 250:
+                out[yy_i, xx_i, 0] = rr
+                out[yy_i, xx_i, 1] = rg
+                out[yy_i, xx_i, 2] = rb
+            else:
+                nr = int(out_r + ((rr - out_r) * ra) / 255.0)
+                ng = int(out_g + ((rg - out_g) * ra) / 255.0)
+                nb = int(out_b + ((rb - out_b) * ra) / 255.0)
+                out[yy_i, xx_i, 0] = nr
+                out[yy_i, xx_i, 1] = ng
+                out[yy_i, xx_i, 2] = nb
+        self.out_arr[..., :3] = np.clip(out[..., :3], 0, 255).astype(np.uint8)
 
     def add(self, inp: Input):
-        if self.out is None or self.mapping is None:
+        if self.out_arr is None or self.mapping is None:
             self.logger.warning(
                 "add called before pre() or with invalid mapping, skipping"
             )
@@ -323,184 +319,241 @@ class Render:
 
         st = self._prepare_input_state(inp)
         active_scale = st["in_scale"] / 2.0
-        off = (mapping.map2_data.size[1] - mapping.light_data.size[1]) // 2
-
-        out_pix = self.out.load()
-        map1_pix = mapping.map1_data.load()
-        map2_pix = mapping.map2_data.load()
-        light_pix = mapping.light_data.load()
-        dark_pix = mapping.dark_data.load()
-        in_img = inp.image.convert("RGBA")
+        off = self.off
 
         if (
-            map1_pix is None
-            or map2_pix is None
-            or light_pix is None
-            or dark_pix is None
-            or out_pix is None
+            self.map1_arr is None
+            or self.map2_arr is None
+            or self.light_arr is None
+            or self.dark_arr is None
+            or self.out_arr is None
         ):
             self.logger.panic("Failed to load pixel data for add")
             raise ValueError("Failed to load pixel data for add")
 
-        for y in range(h):
-            for x in range(w):
-                light_pixel = self._get_pixel_from_pixel_access(light_pix, x, y)
-                dark_pixel = self._get_pixel_from_pixel_access(dark_pix, x, y)
-                map_pixel = self._get_pixel_from_pixel_access(map1_pix, x, y + off)
-                sel_pixel = self._get_pixel_from_pixel_access(map2_pix, x, y + off)
-                d = sel_pixel[0] == inp.layer
-                if not d:
-                    continue
-                act = map_pixel[3]
-                if act <= 25:
-                    continue
+        mp = self.map1_arr[off : off + h, 0:w, :].astype(np.int32)
+        sel = self.map2_arr[off : off + h, 0:w, :].astype(np.int32)
+        light = self.light_arr.astype(np.int32)
+        dark = self.dark_arr.astype(np.int32)
+        in_arr = self._to_rgba_arr(inp.image)
 
-                mod = map_pixel[2]
-                ymod = mod // 16
-                xmod = mod % 16
-                x1 = map_pixel[0] + 256 * xmod - RR
-                y1 = map_pixel[1] + 256 * ymod - RR
+        mod = mp[..., 2].astype(np.int32)
+        ymod = mod // 16
+        xmod = mod % 16
+        x1 = (mp[..., 0].astype(np.int32) + 256 * xmod - RR).astype(np.float64)
+        y1 = (mp[..., 1].astype(np.int32) + 256 * ymod - RR).astype(np.float64)
 
-                x12 = x1
-                y12 = y1
-                x13 = x1
-                y13 = y1
+        x12 = x1.copy()
+        y12 = y1.copy()
+        x13 = x1.copy()
+        y13 = y1.copy()
 
-                if x < w - 1 and y < h - 1:
-                    mdx = self._get_pixel_from_pixel_access(map1_pix, x + 1, y + off)
-                    mdy = self._get_pixel_from_pixel_access(map1_pix, x, y + 1 + off)
-                    if mdx[3] > 127 and mdy[3] > 127:
-                        idx2 = self._get_pixel_from_pixel_access(
-                            map2_pix, x + 1, y + off
-                        )
-                        idx3 = self._get_pixel_from_pixel_access(
-                            map2_pix, x, y + 1 + off
-                        )
-                        if idx2[0] == inp.layer and idx3[0] == inp.layer:
-                            mod2 = mdx[2]
-                            ymod2 = mod2 // 16
-                            xmod2 = mod2 % 16
-                            x12 = mdx[0] + 256 * xmod2 - RR
-                            y12 = mdx[1] + 256 * ymod2 - RR
-
-                            mod3 = mdy[2]
-                            ymod3 = mod3 // 16
-                            xmod3 = mod3 % 16
-                            x13 = mdy[0] + 256 * xmod3 - RR
-                            y13 = mdy[1] + 256 * ymod3 - RR
-
-                        da = sqrt((x1 - x12) ** 2 + (y1 - y12) ** 2)
-                        db = sqrt((x1 - x13) ** 2 + (y1 - y13) ** 2)
-                        if da > 400.0 or db > 400.0:
-                            x12 = x1
-                            y12 = y1
-                            x13 = x1
-                            y13 = y1
-
-                x1 *= st["xs"]
-                y1 *= st["ys"]
-                xx = st["xa"] * x1 + st["ya"] * y1
-                yy = -st["ya"] * x1 + st["xa"] * y1
-                xx += RR + st["xo"]
-                yy += RR + st["yo"]
-                xx = st["in_x0"] + active_scale * xx / RR
-                yy = st["in_y0"] + active_scale * yy / RR
-
-                x12 *= st["xs"]
-                y12 *= st["ys"]
-                xxa = st["xa"] * x12 + st["ya"] * y12
-                yya = -st["ya"] * x12 + st["xa"] * y12
-                xxa += RR + st["xo"]
-                yya += RR + st["yo"]
-                xxa = st["in_x0"] + active_scale * xxa / RR
-                yya = st["in_y0"] + active_scale * yya / RR
-
-                x13 *= st["xs"]
-                y13 *= st["ys"]
-                xxb = st["xa"] * x13 + st["ya"] * y13
-                yyb = -st["ya"] * x13 + st["xa"] * y13
-                xxb += RR + st["xo"]
-                yyb += RR + st["yo"]
-                xxb = st["in_x0"] + active_scale * xxb / RR
-                yyb = st["in_y0"] + active_scale * yyb / RR
-
-                xxa -= xx
-                yya -= yy
-                xxb -= xx
-                yyb -= yy
-
-                mo = self._sample_linear(in_img, xx, yy)
-                m2 = self._sample_linear(in_img, xx + xxa / 2.0, yy + yya / 2.0)
-                m3 = self._sample_linear(in_img, xx - xxa / 2.0, yy - yya / 2.0)
-                m4 = self._sample_linear(in_img, xx + xxb / 2.0, yy + yyb / 2.0)
-                m5 = self._sample_linear(in_img, xx - xxb / 2.0, yy - yyb / 2.0)
-
-                m2b = self._sample_linear(
-                    in_img, xx + (xxa + xxb) / 2.0, yy + (yya + yyb) / 2.0
+        if h > 1 and w > 1:
+            mdx = mp[0 : h - 1, 1:w, :].astype(np.int32)
+            mdy = mp[1:h, 0 : w - 1, :].astype(np.int32)
+            idx2 = sel[0 : h - 1, 1:w, 0].astype(np.int32)
+            idx3 = sel[1:h, 0 : w - 1, 0].astype(np.int32)
+            valid = (
+                (mdx[..., 3] > 127)
+                & (mdy[..., 3] > 127)
+                & (idx2 == inp.layer)
+                & (idx3 == inp.layer)
+            )
+            if valid.any():
+                mod2 = mdx[..., 2].astype(np.int32)
+                ymod2 = mod2 // 16
+                xmod2 = mod2 % 16
+                x12_temp = (mdx[..., 0].astype(np.int32) + 256 * xmod2 - RR).astype(
+                    np.float64
                 )
-                m3b = self._sample_linear(
-                    in_img, xx + (xxa - xxb) / 2.0, yy + (yya - yyb) / 2.0
-                )
-                m4b = self._sample_linear(
-                    in_img, xx - (xxa + xxb) / 2.0, yy - (yya + yyb) / 2.0
-                )
-                m5b = self._sample_linear(
-                    in_img, xx - (xxa - xxb) / 2.0, yy - (yya - yyb) / 2.0
+                y12_temp = (mdx[..., 1].astype(np.int32) + 256 * ymod2 - RR).astype(
+                    np.float64
                 )
 
-                mo.preblend()
-                m2.preblend()
-                m3.preblend()
-                m4.preblend()
-                m5.preblend()
-                m2b.preblend()
-                m3b.preblend()
-                m4b.preblend()
-                m5b.preblend()
-
-                sc = (
-                    mo.a * 4.0
-                    + (m2.a + m3.a + m4.a + m5.a) * 2.0
-                    + (m2b.a + m3b.a + m4b.a + m5b.a)
-                ) / 16.0
-                compound = (
-                    (mo * 4.0) + ((m2 + m3 + m4 + m5) * 2.0) + (m2b + m3b + m4b + m5b)
+                mod3 = mdy[..., 2].astype(np.int32)
+                ymod3 = mod3 // 16
+                xmod3 = mod3 % 16
+                x13_temp = (mdy[..., 0].astype(np.int32) + 256 * xmod3 - RR).astype(
+                    np.float64
                 )
-                mo = compound / 16.0
-                if sc > 0.0001:
-                    mo.postblend(sc)
-                else:
-                    mo.r = mo.g = mo.b = mo.a = 0.0
+                y13_temp = (mdy[..., 1].astype(np.int32) + 256 * ymod3 - RR).astype(
+                    np.float64
+                )
 
-                m_r = mo.r
-                m_g = mo.g
-                m_b = mo.b
-                m_a = mo.a
+                x1_in = x1[0 : h - 1, 0 : w - 1]
+                y1_in = y1[0 : h - 1, 0 : w - 1]
+                da = np.sqrt((x1_in - x12_temp) ** 2 + (y1_in - y12_temp) ** 2)
+                db = np.sqrt((x1_in - x13_temp) ** 2 + (y1_in - y13_temp) ** 2)
+                keep = valid & (da <= 400.0) & (db <= 400.0)
+                x12[0 : h - 1, 0 : w - 1][keep] = x12_temp[keep]
+                y12[0 : h - 1, 0 : w - 1][keep] = y12_temp[keep]
+                x13[0 : h - 1, 0 : w - 1][keep] = x13_temp[keep]
+                y13[0 : h - 1, 0 : w - 1][keep] = y13_temp[keep]
 
-                if d and act > 25:
-                    result_r = int(
-                        dark_pixel[0] + ((light_pixel[0] - dark_pixel[0]) * m_r) / 255.0
-                    )
-                    result_g = int(
-                        dark_pixel[1] + ((light_pixel[1] - dark_pixel[1]) * m_g) / 255.0
-                    )
-                    result_b = int(
-                        dark_pixel[2] + ((light_pixel[2] - dark_pixel[2]) * m_b) / 255.0
-                    )
-                    result_a = int(m_a)
-                    if dark_pixel[3] < result_a:
-                        result_a = dark_pixel[3]
-                    if result_a > 0:
-                        out_r, out_g, out_b, out_a = self._get_pixel_from_pixel_access(
-                            out_pix, x, y
-                        )
-                        if result_a > 250:
-                            out_pix[x, y] = (result_r, result_g, result_b, out_a)
-                        else:
-                            nr = int(out_r + ((result_r - out_r) * result_a) / 255.0)
-                            ng = int(out_g + ((result_g - out_g) * result_a) / 255.0)
-                            nb = int(out_b + ((result_b - out_b) * result_a) / 255.0)
-                            out_pix[x, y] = (nr, ng, nb, out_a)
+        x1 *= st["xs"]
+        y1 *= st["ys"]
+        xx = st["xa"] * x1 + st["ya"] * y1
+        yy = -st["ya"] * x1 + st["xa"] * y1
+        xx += RR + st["xo"]
+        yy += RR + st["yo"]
+        xx = st["in_x0"] + active_scale * xx / RR
+        yy = st["in_y0"] + active_scale * yy / RR
+
+        x12 *= st["xs"]
+        y12 *= st["ys"]
+        xxa = st["xa"] * x12 + st["ya"] * y12
+        yya = -st["ya"] * x12 + st["xa"] * y12
+        xxa += RR + st["xo"]
+        yya += RR + st["yo"]
+        xxa = st["in_x0"] + active_scale * xxa / RR
+        yya = st["in_y0"] + active_scale * yya / RR
+
+        x13 *= st["xs"]
+        y13 *= st["ys"]
+        xxb = st["xa"] * x13 + st["ya"] * y13
+        yyb = -st["ya"] * x13 + st["xa"] * y13
+        xxb += RR + st["xo"]
+        yyb += RR + st["yo"]
+        xxb = st["in_x0"] + active_scale * xxb / RR
+        yyb = st["in_y0"] + active_scale * yyb / RR
+
+        xxa -= xx
+        yya -= yy
+        xxb -= xx
+        yyb -= yy
+
+        map_mo_x = xx.astype(np.float32)
+        map_mo_y = yy.astype(np.float32)
+        map_m2_x = (xx + xxa / 2.0).astype(np.float32)
+        map_m2_y = (yy + yya / 2.0).astype(np.float32)
+        map_m3_x = (xx - xxa / 2.0).astype(np.float32)
+        map_m3_y = (yy - yya / 2.0).astype(np.float32)
+        map_m4_x = (xx + xxb / 2.0).astype(np.float32)
+        map_m4_y = (yy + yyb / 2.0).astype(np.float32)
+        map_m5_x = (xx - xxb / 2.0).astype(np.float32)
+        map_m5_y = (yy - yyb / 2.0).astype(np.float32)
+
+        map_m2b_x = (xx + (xxa + xxb) / 2.0).astype(np.float32)
+        map_m2b_y = (yy + (yya + yyb) / 2.0).astype(np.float32)
+        map_m3b_x = (xx + (xxa - xxb) / 2.0).astype(np.float32)
+        map_m3b_y = (yy + (yya - yyb) / 2.0).astype(np.float32)
+        map_m4b_x = (xx - (xxa + xxb) / 2.0).astype(np.float32)
+        map_m4b_y = (yy - (yya + yyb) / 2.0).astype(np.float32)
+        map_m5b_x = (xx - (xxa - xxb) / 2.0).astype(np.float32)
+        map_m5b_y = (yy - (yya - yyb) / 2.0).astype(np.float32)
+
+        mo = self._remap_sample(
+            in_arr, map_mo_x, map_mo_y, interp=cv2.INTER_LINEAR
+        ).astype(np.float64)
+        m2 = self._remap_sample(
+            in_arr, map_m2_x, map_m2_y, interp=cv2.INTER_LINEAR
+        ).astype(np.float64)
+        m3 = self._remap_sample(
+            in_arr, map_m3_x, map_m3_y, interp=cv2.INTER_LINEAR
+        ).astype(np.float64)
+        m4 = self._remap_sample(
+            in_arr, map_m4_x, map_m4_y, interp=cv2.INTER_LINEAR
+        ).astype(np.float64)
+        m5 = self._remap_sample(
+            in_arr, map_m5_x, map_m5_y, interp=cv2.INTER_LINEAR
+        ).astype(np.float64)
+        m2b = self._remap_sample(
+            in_arr, map_m2b_x, map_m2b_y, interp=cv2.INTER_LINEAR
+        ).astype(np.float64)
+        m3b = self._remap_sample(
+            in_arr, map_m3b_x, map_m3b_y, interp=cv2.INTER_LINEAR
+        ).astype(np.float64)
+        m4b = self._remap_sample(
+            in_arr, map_m4b_x, map_m4b_y, interp=cv2.INTER_LINEAR
+        ).astype(np.float64)
+        m5b = self._remap_sample(
+            in_arr, map_m5b_x, map_m5b_y, interp=cv2.INTER_LINEAR
+        ).astype(np.float64)
+
+        def pre_rgb(mat):
+            return (
+                mat[..., 0] * mat[..., 3],
+                mat[..., 1] * mat[..., 3],
+                mat[..., 2] * mat[..., 3],
+                mat[..., 3],
+            )
+
+        mo_rp, mo_gp, mo_bp, mo_ap = pre_rgb(mo)
+        m2_rp, m2_gp, m2_bp, m2_ap = pre_rgb(m2)
+        m3_rp, m3_gp, m3_bp, m3_ap = pre_rgb(m3)
+        m4_rp, m4_gp, m4_bp, m4_ap = pre_rgb(m4)
+        m5_rp, m5_gp, m5_bp, m5_ap = pre_rgb(m5)
+        m2b_rp, m2b_gp, m2b_bp, m2b_ap = pre_rgb(m2b)
+        m3b_rp, m3b_gp, m3b_bp, m3b_ap = pre_rgb(m3b)
+        m4b_rp, m4b_gp, m4b_bp, m4b_ap = pre_rgb(m4b)
+        m5b_rp, m5b_gp, m5b_bp, m5b_ap = pre_rgb(m5b)
+
+        sum_a = (
+            4.0 * mo_ap
+            + 2.0 * (m2_ap + m3_ap + m4_ap + m5_ap)
+            + (m2b_ap + m3b_ap + m4b_ap + m5b_ap)
+        )
+        sum_r = (
+            4.0 * mo_rp
+            + 2.0 * (m2_rp + m3_rp + m4_rp + m5_rp)
+            + (m2b_rp + m3b_rp + m4b_rp + m5b_rp)
+        )
+        sum_g = (
+            4.0 * mo_gp
+            + 2.0 * (m2_gp + m3_gp + m4_gp + m5_gp)
+            + (m2b_gp + m3b_gp + m4b_gp + m5b_gp)
+        )
+        sum_b = (
+            4.0 * mo_bp
+            + 2.0 * (m2_bp + m3_bp + m4_bp + m5_bp)
+            + (m2b_bp + m3b_bp + m4b_bp + m5b_bp)
+        )
+
+        eps = 1e-8
+        m_a = sum_a / 16.0
+        denom = sum_a
+        mask_valid = denom > eps
+        m_r = np.zeros_like(sum_r)
+        m_g = np.zeros_like(sum_g)
+        m_b = np.zeros_like(sum_b)
+        m_r[mask_valid] = sum_r[mask_valid] / denom[mask_valid]
+        m_g[mask_valid] = sum_g[mask_valid] / denom[mask_valid]
+        m_b[mask_valid] = sum_b[mask_valid] / denom[mask_valid]
+
+        d_mask = sel[..., 0] == inp.layer
+        act_mask = mp[..., 3] > 25
+        use_mask = d_mask & act_mask & (m_a > 0)
+        if not use_mask.any():
+            return
+
+        result_r = dark[..., 0] + ((light[..., 0] - dark[..., 0]) * m_r) / 255.0
+        result_g = dark[..., 1] + ((light[..., 1] - dark[..., 1]) * m_g) / 255.0
+        result_b = dark[..., 2] + ((light[..., 2] - dark[..., 2]) * m_b) / 255.0
+        result_a = m_a.astype(np.int32)
+        result_a = np.minimum(result_a, dark[..., 3])
+
+        out = self.out_arr.astype(np.int32)
+        ys_idx, xs_idx = np.where(use_mask)
+        for yy_i, xx_i in zip(ys_idx, xs_idx):
+            ra = int(result_a[yy_i, xx_i])
+            if ra <= 0:
+                continue
+            rr = int(result_r[yy_i, xx_i])
+            rg = int(result_g[yy_i, xx_i])
+            rb = int(result_b[yy_i, xx_i])
+            out_r, out_g, out_b, out_a = out[yy_i, xx_i]
+            if ra > 250:
+                out[yy_i, xx_i, 0] = rr
+                out[yy_i, xx_i, 1] = rg
+                out[yy_i, xx_i, 2] = rb
+            else:
+                nr = int(out_r + ((rr - out_r) * ra) / 255.0)
+                ng = int(out_g + ((rg - out_g) * ra) / 255.0)
+                nb = int(out_b + ((rb - out_b) * ra) / 255.0)
+                out[yy_i, xx_i, 0] = nr
+                out[yy_i, xx_i, 1] = ng
+                out[yy_i, xx_i, 2] = nb
+        self.out_arr[..., :3] = np.clip(out[..., :3], 0, 255).astype(np.uint8)
 
     def getCloud(self, inp: Input, cloud: List[CloudPoint]):
         if self.mapping is None:
@@ -517,38 +570,48 @@ class Render:
             )
             return
 
-        for y in range(self.mapping.light_data.size[1]):
-            for x in range(self.mapping.light_data.size[0]):
-                light_pixel = self._get_pixel(self.mapping.light_data, x, y)
-                dark_pixel = self._get_pixel(self.mapping.dark_data, x, y)
-                map_pixel = self._get_pixel(self.mapping.map1_data, x, y + off)
-                sel_pixel = self._get_pixel(self.mapping.map2_data, x, y + off)
-                mod = map_pixel[2]
-                ymod = mod // 16
-                xmod = mod % 16
-                act = map_pixel[3]
-                x1 = map_pixel[0] + 256 * xmod - RR
-                y1 = map_pixel[1] + 256 * ymod - RR
-                x1 *= st["xs"]
-                y1 *= st["ys"]
-                xx = st["xa"] * x1 + st["ya"] * y1
-                yy = -st["ya"] * x1 + st["xa"] * y1
-                xx += RR + st["xo"]
-                yy += RR + st["yo"]
-                xx = st["in_x0"] + active_scale * xx / RR
-                yy = st["in_y0"] + active_scale * yy / RR
-                if sel_pixel[0] != 0 and act > 25:
-                    delv = 5
-                    if (
-                        (
-                            abs(light_pixel[0] - dark_pixel[0]) > delv
-                            or abs(light_pixel[1] - dark_pixel[1]) > delv
-                            or abs(light_pixel[2] - dark_pixel[2]) > delv
-                        )
-                        and dark_pixel[3] > 100
-                        and light_pixel[3] > 100
-                    ):
-                        cloud.append(CloudPoint(sel_pixel[0], xx, yy))
+        if (
+            self.map1_arr is None
+            or self.map2_arr is None
+            or self.light_arr is None
+            or self.dark_arr is None
+        ):
+            return
+        h, w = self.light_arr.shape[:2]
+        mp = self.map1_arr[off : off + h, 0:w, :].astype(np.int32)
+        sel = self.map2_arr[off : off + h, 0:w, :].astype(np.int32)
+        light = self.light_arr.astype(np.int32)
+        dark = self.dark_arr.astype(np.int32)
+
+        mod = mp[..., 2]
+        ymod = mod // 16
+        xmod = mod % 16
+        x1 = (mp[..., 0] + 256 * xmod - RR).astype(np.float64)
+        y1 = (mp[..., 1] + 256 * ymod - RR).astype(np.float64)
+        x1 *= st["xs"]
+        y1 *= st["ys"]
+        xx = st["xa"] * x1 + st["ya"] * y1
+        yy = -st["ya"] * x1 + st["xa"] * y1
+        xx += RR + st["xo"]
+        yy += RR + st["yo"]
+        xx = st["in_x0"] + active_scale * xx / RR
+        yy = st["in_y0"] + active_scale * yy / RR
+
+        sel_nonzero = sel[..., 0] != 0
+        act_mask = mp[..., 3] > 25
+        delv = 5
+        color_diff = (
+            (np.abs(light[..., 0] - dark[..., 0]) > delv)
+            | (np.abs(light[..., 1] - dark[..., 1]) > delv)
+            | (np.abs(light[..., 2] - dark[..., 2]) > delv)
+        )
+        alpha_ok = (dark[..., 3] > 100) & (light[..., 3] > 100)
+        mask = sel_nonzero & act_mask & color_diff & alpha_ok
+        ys, xs = np.where(mask)
+        for ry, rx in zip(ys, xs):
+            cloud.append(
+                CloudPoint(int(sel[ry, rx, 0]), float(xx[ry, rx]), float(yy[ry, rx]))
+            )
 
     def auto_zoom(self, inp: Input) -> bool:
         if self.mapping is None:
@@ -562,39 +625,34 @@ class Render:
             )
             return False
 
-        x_min = inp.image.width
-        x_max = 0
-        y_min = inp.image.height
-        y_max = 0
-        for y in range(self.mapping.light_data.size[1]):
-            for x in range(self.mapping.light_data.size[0]):
-                map_pixel = self._get_pixel(self.mapping.map1_data, x, y + off)
-                sel_pixel = self._get_pixel(self.mapping.map2_data, x, y + off)
-                mod = map_pixel[2]
-                ymod = mod // 16
-                xmod = mod % 16
-                act = map_pixel[3]
-                x1 = map_pixel[0] + 256 * xmod - RR
-                y1 = map_pixel[1] + 256 * ymod - RR
-                x1 *= st["xs"]
-                y1 *= st["ys"]
-                xx = st["xa"] * x1 + st["ya"] * y1
-                yy = -st["ya"] * x1 + st["xa"] * y1
-                xx += RR + st["xo"]
-                yy += RR + st["yo"]
-                xx = st["in_x0"] + active_scale * xx / RR
-                yy = st["in_y0"] + active_scale * yy / RR
+        if self.map1_arr is None or self.map2_arr is None or self.light_arr is None:
+            self.logger.debug(
+                "One or more required arrays are None in auto_zoom(), skipping"
+            )
+            return False
+        h, w = self.light_arr.shape[:2]
+        mp = self.map1_arr[off : off + h, 0:w, :].astype(np.int32)
+        sel = self.map2_arr[off : off + h, 0:w, :].astype(np.int32)
 
-                d = sel_pixel[0] == 1
-                if d and act > 25:
-                    if xx < x_min:
-                        x_min = xx
-                    if xx > x_max:
-                        x_max = xx
-                    if yy < y_min:
-                        y_min = yy
-                    if yy > y_max:
-                        y_max = yy
+        mod = mp[..., 2]
+        ymod = mod // 16
+        xmod = mod % 16
+        x1 = (mp[..., 0] + 256 * xmod - RR).astype(np.float64)
+        y1 = (mp[..., 1] + 256 * ymod - RR).astype(np.float64)
+        x1 *= st["xs"]
+        y1 *= st["ys"]
+        xx = st["xa"] * x1 + st["ya"] * y1
+        yy = -st["ya"] * x1 + st["xa"] * y1
+        xx += RR + st["xo"]
+        yy += RR + st["yo"]
+        xx = st["in_x0"] + active_scale * xx / RR
+        yy = st["in_y0"] + active_scale * yy / RR
+
+        mask = (sel[..., 0] == 1) & (mp[..., 3] > 25)
+        if not mask.any():
+            return False
+        y_min = float(np.min(yy[mask]))
+        y_max = float(np.max(yy[mask]))
 
         hh = inp.image.height
         if (y_max - y_min) < (hh * 0.75):
@@ -624,12 +682,13 @@ class Render:
                 self.logger.debug(f"Adding input with high quality: {inp}")
                 self.add(inp)
         self.post()
-        if self.out is None:
+        if self.out_arr is None:
             self.logger.panic("Output image not set after rendering")
             raise ValueError("Output image not set after rendering")
 
-        if w > 0 and h > 0 and (w != self.out.width or h != self.out.height):
-            wi, hi = self.out.size
+        if w > 0 and h > 0:
+            out_pil = Image.fromarray(self.out_arr, mode="RGBA")
+            wi, hi = out_pil.size
             fi = wi / hi
             f = w / h
             xo = 0
@@ -645,16 +704,11 @@ class Render:
                 wo = int(h * fi)
                 xo = (w - wo) // 2
             out_scaled = Image.new("RGBA", (w, h), (255, 255, 255, 0))
-            resized = self.out.resize((wo, ho), resample=Image.Resampling.LANCZOS)
+            resized = out_pil.resize((wo, ho), resample=Image.Resampling.LANCZOS)
             out_scaled.paste(resized, (xo, yo), resized)
-            # ensure full alpha
-            px = out_scaled.load()
-            if px is None:
-                self.logger.panic("Failed to load pixel data for out_scaled")
-                raise ValueError("Failed to load pixel data for out_scaled")
-            for yy in range(h):
-                for xx in range(w):
-                    r, g, b, _ = self._get_pixel_from_pixel_access(px, xx, yy)
-                    px[xx, yy] = (r, g, b, 255)
-            self.out = out_scaled
-        return self.out
+            out_arr = np.array(out_scaled)
+            out_arr[..., 3] = 255
+            out_scaled = Image.fromarray(out_arr, mode="RGBA")
+            self.out_arr = np.array(out_scaled)
+            return out_scaled
+        return Image.fromarray(self.out_arr, mode="RGBA")
