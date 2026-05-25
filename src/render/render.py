@@ -76,13 +76,15 @@ class Render:
         map_x: np.ndarray,
         map_y: np.ndarray,
         interp=cv2.INTER_LINEAR,
+        border_value=(0, 0, 0, 0),
     ) -> np.ndarray:
         return cv2.remap(
             in_arr,
             map_x.astype(np.float32),
             map_y.astype(np.float32),
             interpolation=interp,
-            borderMode=cv2.BORDER_TRANSPARENT,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=border_value,
         )
 
     def _prepare_input_state(self, inp: Input):
@@ -237,7 +239,7 @@ class Render:
         map_x = xx.astype(np.float32)
         map_y = yy.astype(np.float32)
         sampled = self._remap_sample(
-            in_arr, map_x, map_y, interp=cv2.INTER_NEAREST
+            in_arr, map_x, map_y, interp=cv2.INTER_LINEAR
         ).astype(np.int32)
 
         d_mask = sel[..., 0] == inp.layer
@@ -256,29 +258,27 @@ class Render:
             dark[..., 2] + ((light[..., 2] - dark[..., 2]) * sampled[..., 2]) / 255.0
         )
         result_a = sampled[..., 3]
-        result_a = np.maximum(result_a, light[..., 3])
+        result_a = np.minimum(result_a, dark[..., 3])
 
         out = self.out_arr.astype(np.int32)
-        ys_idx, xs_idx = np.where(use_mask)
-        for yy_i, xx_i in zip(ys_idx, xs_idx):
-            ra = int(result_a[yy_i, xx_i])
-            if ra <= 0:
-                continue
-            rr = int(result_r[yy_i, xx_i])
-            rg = int(result_g[yy_i, xx_i])
-            rb = int(result_b[yy_i, xx_i])
-            out_r, out_g, out_b, _ = out[yy_i, xx_i]
-            if ra > 250:
-                out[yy_i, xx_i, 0] = rr
-                out[yy_i, xx_i, 1] = rg
-                out[yy_i, xx_i, 2] = rb
-            else:
-                nr = int(out_r + ((rr - out_r) * ra) / 255.0)
-                ng = int(out_g + ((rg - out_g) * ra) / 255.0)
-                nb = int(out_b + ((rb - out_b) * ra) / 255.0)
-                out[yy_i, xx_i, 0] = nr
-                out[yy_i, xx_i, 1] = ng
-                out[yy_i, xx_i, 2] = nb
+
+        rrgb = np.stack([result_r, result_g, result_b], axis=-1).astype(np.int32)
+        ra = result_a.astype(np.int32)
+
+        full_mask = use_mask
+        replace_mask = full_mask & (ra > 250)
+        blend_mask = full_mask & (ra > 0) & (ra <= 250)
+
+        if replace_mask.any():
+            out[replace_mask, 0:3] = rrgb[replace_mask]
+
+        if blend_mask.any():
+            ra_f = (ra[blend_mask].astype(np.float64) / 255.0)[..., None]
+            dst = out[blend_mask, 0:3].astype(np.float64)
+            src = rrgb[blend_mask].astype(np.float64)
+            blended = np.round(dst + (src - dst) * ra_f).astype(np.int32)
+            out[blend_mask, 0:3] = blended
+
         self.out_arr[..., :3] = np.clip(out[..., :3], 0, 255).astype(np.uint8)
 
     def add(self, inp: Input):
