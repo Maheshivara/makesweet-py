@@ -77,13 +77,12 @@ class Render:
         map_y: np.ndarray,
         interp=cv2.INTER_LINEAR,
     ) -> np.ndarray:
-        # use replicate border to mimic clamping behavior
         return cv2.remap(
             in_arr,
             map_x.astype(np.float32),
             map_y.astype(np.float32),
             interpolation=interp,
-            borderMode=cv2.BORDER_REPLICATE,
+            borderMode=cv2.BORDER_TRANSPARENT,
         )
 
     def _prepare_input_state(self, inp: Input):
@@ -126,9 +125,7 @@ class Render:
         if mapping.neutral_data is not None:
             self.out_arr = self._to_rgba_arr(mapping.neutral_data.copy())
         else:
-            self.out_arr = np.zeros((h, w, 4), dtype=np.uint8)
-            self.out_arr[..., :3] = 255
-            self.out_arr[..., 3] = 0
+            self.out_arr = self._to_rgba_arr(mapping.light_data.copy())
 
     def post(self):
         if self.out_arr is None or self.mapping is None:
@@ -676,10 +673,8 @@ class Render:
 
         for inp in inputs:
             if self.quality == RenderQuality.SIMPLE:
-                self.logger.debug(f"Adding input with simple quality: {inp}")
                 self.add_simple(inp)
             else:
-                self.logger.debug(f"Adding input with high quality: {inp}")
                 self.add(inp)
         self.post()
         if self.out_arr is None:
