@@ -42,14 +42,45 @@ class Render:
         self.off: int = 0
 
     def _clamp_int(self, v: int, a: int, b: int) -> int:
+        """
+        Clamp value to integer range [a, b].
+
+        Args:
+            v: Value to clamp.
+            a: Minimum allowed value.
+            b: Maximum allowed value.
+
+        Returns:
+            The clamped integer value.
+        """
         return max(a, min(b, int(v)))
 
     def _to_rgba_arr(self, img: Image.Image) -> np.ndarray:
+        """
+        Convert a PIL image to a numpy RGBA uint8 array.
+
+        Args:
+            img: PIL Image to convert.
+
+        Returns:
+            Numpy array with shape (H, W, 4) and dtype uint8.
+        """
         if img.mode != "RGBA":
             img = img.convert("RGBA")
         return np.array(img, dtype=np.uint8)
 
     def _array_get(self, arr: np.ndarray, x: int, y: int):
+        """
+        Safely get an RGBA pixel tuple from a numpy array.
+
+        Args:
+            arr: Numpy array containing RGBA pixels.
+            x: X coordinate.
+            y: Y coordinate.
+
+        Returns:
+            A 4-tuple (R,G,B,A) as ints; returns transparent black for OOB.
+        """
         h, w = arr.shape[:2]
         if 0 <= x < w and 0 <= y < h:
             px = arr[y, x]
@@ -65,6 +96,17 @@ class Render:
             return (0, 0, 0, 0)
 
     def _safe_arr_pixel(self, arr: np.ndarray, x: int, y: int):
+        """
+        Get pixel clamped to array bounds.
+
+        Args:
+            arr: Numpy RGBA array.
+            x: Requested x coordinate.
+            y: Requested y coordinate.
+
+        Returns:
+            A 4-tuple (R,G,B,A) as ints for the nearest valid pixel.
+        """
         h, w = arr.shape[:2]
         x = self._clamp_int(x, 0, w - 1)
         y = self._clamp_int(y, 0, h - 1)
@@ -78,6 +120,18 @@ class Render:
         interp=cv2.INTER_LINEAR,
         border_value=(0, 0, 0, 0),
     ) -> np.ndarray:
+        """Remap input image using provided map coordinates.
+
+        Args:
+            in_arr: Source RGBA numpy array.
+            map_x: X-coordinate map (float array).
+            map_y: Y-coordinate map (float array).
+            interp: OpenCV interpolation flag.
+            border_value: RGBA tuple used for borders.
+
+        Returns:
+            Remapped numpy array (same dtype as OpenCV output).
+        """
         return cv2.remap(
             in_arr,
             map_x.astype(np.float32),
@@ -87,29 +141,17 @@ class Render:
             borderValue=border_value,
         )
 
-    def _prepare_input_state(self, inp: Input):
-        xs = float(inp.scale[0])
-        ys = float(inp.scale[1])
-        xa = float(inp.angle_cos)
-        ya = float(inp.angle_sin)
-        in_scale = float(inp.map_size[0])
-        in_x0 = float(inp.center_offset[0])
-        in_y0 = float(inp.center_offset[1])
-        xo = float(inp.map_units_offset[0])
-        yo = float(inp.map_units_offset[1])
-        return {
-            "xs": xs,
-            "ys": ys,
-            "xa": xa,
-            "ya": ya,
-            "in_scale": in_scale,
-            "in_x0": in_x0,
-            "in_y0": in_y0,
-            "xo": xo,
-            "yo": yo,
-        }
-
     def pre(self, frame_index: int, template: Template):
+        """
+        Prepare internal arrays for rendering a frame.
+
+        Args:
+            frame_index: Index of the frame in the template to use.
+            template: Template containing frame mappings.
+
+        Returns:
+            None. Sets up internal numpy arrays on the instance.
+        """
         mapping = template.frames[frame_index]
         self.mapping = mapping
         w, h = mapping.light_data.size
@@ -130,6 +172,12 @@ class Render:
             self.out_arr = self._to_rgba_arr(mapping.light_data.copy())
 
     def post(self):
+        """
+        Post-process the rendered output to smooth edges.
+
+        Returns:
+            None. Modifies `self.out_arr` in-place.
+        """
         if self.out_arr is None or self.mapping is None:
             return
         pre = self.out_arr.copy()
@@ -189,6 +237,15 @@ class Render:
                 ).astype(np.uint8)
 
     def add_simple(self, inp: Input):
+        """
+        Add a single input image to the output using simple mapping.
+
+        Args:
+            inp: Input object containing image and mapping parameters.
+
+        Returns:
+            None. Modifies `self.out_arr` in-place.
+        """
         if self.out_arr is None or self.mapping is None:
             self.logger.warning(
                 "add_simple called before pre() or with invalid mapping, skipping"
@@ -201,8 +258,16 @@ class Render:
             )
             return
 
-        st = self._prepare_input_state(inp)
-        active_scale = st["in_scale"] / 2.0
+        scale_x = float(inp.scale[0])
+        scale_y = float(inp.scale[1])
+        angle_cos = float(inp.angle_cos)
+        angle_sin = float(inp.angle_sin)
+        input_map_size = float(inp.map_size[0])
+        center_offset_x = float(inp.center_offset[0])
+        center_offset_y = float(inp.center_offset[1])
+        map_units_offset_x = float(inp.map_units_offset[0])
+        map_units_offset_y = float(inp.map_units_offset[1])
+        active_scale = input_map_size / 2.0
         off = self.off
 
         if (
@@ -225,19 +290,19 @@ class Render:
         mod = mp[..., 2].astype(np.int32)
         ymod = mod // 16
         xmod = mod % 16
-        x1 = (mp[..., 0].astype(np.int32) + 256 * xmod - RR).astype(np.float64)
-        y1 = (mp[..., 1].astype(np.int32) + 256 * ymod - RR).astype(np.float64)
-        x1 *= st["xs"]
-        y1 *= st["ys"]
-        xx = st["xa"] * x1 + st["ya"] * y1
-        yy = -st["ya"] * x1 + st["xa"] * y1
-        xx += RR + st["xo"]
-        yy += RR + st["yo"]
-        xx = st["in_x0"] + active_scale * xx / RR
-        yy = st["in_y0"] + active_scale * yy / RR
+        base_x = (mp[..., 0].astype(np.int32) + 256 * xmod - RR).astype(np.float64)
+        base_y = (mp[..., 1].astype(np.int32) + 256 * ymod - RR).astype(np.float64)
+        base_x *= scale_x
+        base_y *= scale_y
+        map_x_coords = angle_cos * base_x + angle_sin * base_y
+        map_y_coords = -angle_sin * base_x + angle_cos * base_y
+        map_x_coords += RR + map_units_offset_x
+        map_y_coords += RR + map_units_offset_y
+        map_x_coords = center_offset_x + active_scale * map_x_coords / RR
+        map_y_coords = center_offset_y + active_scale * map_y_coords / RR
 
-        map_x = xx.astype(np.float32)
-        map_y = yy.astype(np.float32)
+        map_x = map_x_coords.astype(np.float32)
+        map_y = map_y_coords.astype(np.float32)
         sampled = self._remap_sample(
             in_arr, map_x, map_y, interp=cv2.INTER_LINEAR
         ).astype(np.int32)
@@ -282,6 +347,15 @@ class Render:
         self.out_arr[..., :3] = np.clip(out[..., :3], 0, 255).astype(np.uint8)
 
     def add(self, inp: Input):
+        """
+        Add a single input image to the output using high-quality mapping.
+
+        Args:
+            inp: Input object containing image and mapping parameters.
+
+        Returns:
+            None. Modifies `self.out_arr` in-place.
+        """
         if self.out_arr is None or self.mapping is None:
             self.logger.warning(
                 "add called before pre() or with invalid mapping, skipping"
@@ -314,8 +388,16 @@ class Render:
             )
             return
 
-        st = self._prepare_input_state(inp)
-        active_scale = st["in_scale"] / 2.0
+        scale_x = float(inp.scale[0])
+        scale_y = float(inp.scale[1])
+        angle_cos = float(inp.angle_cos)
+        angle_sin = float(inp.angle_sin)
+        input_map_size = float(inp.map_size[0])
+        center_offset_x = float(inp.center_offset[0])
+        center_offset_y = float(inp.center_offset[1])
+        map_units_offset_x = float(inp.map_units_offset[0])
+        map_units_offset_y = float(inp.map_units_offset[1])
+        active_scale = input_map_size / 2.0
         off = self.off
 
         if (
@@ -337,13 +419,13 @@ class Render:
         mod = mp[..., 2].astype(np.int32)
         ymod = mod // 16
         xmod = mod % 16
-        x1 = (mp[..., 0].astype(np.int32) + 256 * xmod - RR).astype(np.float64)
-        y1 = (mp[..., 1].astype(np.int32) + 256 * ymod - RR).astype(np.float64)
+        base_x = (mp[..., 0].astype(np.int32) + 256 * xmod - RR).astype(np.float64)
+        base_y = (mp[..., 1].astype(np.int32) + 256 * ymod - RR).astype(np.float64)
 
-        x12 = x1.copy()
-        y12 = y1.copy()
-        x13 = x1.copy()
-        y13 = y1.copy()
+        base_x2 = base_x.copy()
+        base_y2 = base_y.copy()
+        base_x3 = base_x.copy()
+        base_y3 = base_y.copy()
 
         if h > 1 and w > 1:
             mdx = mp[0 : h - 1, 1:w, :].astype(np.int32)
@@ -360,150 +442,180 @@ class Render:
                 mod2 = mdx[..., 2].astype(np.int32)
                 ymod2 = mod2 // 16
                 xmod2 = mod2 % 16
-                x12_temp = (mdx[..., 0].astype(np.int32) + 256 * xmod2 - RR).astype(
+                base_x2_temp = (mdx[..., 0].astype(np.int32) + 256 * xmod2 - RR).astype(
                     np.float64
                 )
-                y12_temp = (mdx[..., 1].astype(np.int32) + 256 * ymod2 - RR).astype(
+                base_y2_temp = (mdx[..., 1].astype(np.int32) + 256 * ymod2 - RR).astype(
                     np.float64
                 )
 
                 mod3 = mdy[..., 2].astype(np.int32)
                 ymod3 = mod3 // 16
                 xmod3 = mod3 % 16
-                x13_temp = (mdy[..., 0].astype(np.int32) + 256 * xmod3 - RR).astype(
+                base_x3_temp = (mdy[..., 0].astype(np.int32) + 256 * xmod3 - RR).astype(
                     np.float64
                 )
-                y13_temp = (mdy[..., 1].astype(np.int32) + 256 * ymod3 - RR).astype(
+                base_y3_temp = (mdy[..., 1].astype(np.int32) + 256 * ymod3 - RR).astype(
                     np.float64
                 )
 
-                x1_in = x1[0 : h - 1, 0 : w - 1]
-                y1_in = y1[0 : h - 1, 0 : w - 1]
-                da = np.sqrt((x1_in - x12_temp) ** 2 + (y1_in - y12_temp) ** 2)
-                db = np.sqrt((x1_in - x13_temp) ** 2 + (y1_in - y13_temp) ** 2)
-                keep = valid & (da <= 400.0) & (db <= 400.0)
-                x12[0 : h - 1, 0 : w - 1][keep] = x12_temp[keep]
-                y12[0 : h - 1, 0 : w - 1][keep] = y12_temp[keep]
-                x13[0 : h - 1, 0 : w - 1][keep] = x13_temp[keep]
-                y13[0 : h - 1, 0 : w - 1][keep] = y13_temp[keep]
+                base_x_in = base_x[0 : h - 1, 0 : w - 1]
+                base_y_in = base_y[0 : h - 1, 0 : w - 1]
+                dist_a = np.sqrt(
+                    (base_x_in - base_x2_temp) ** 2 + (base_y_in - base_y2_temp) ** 2
+                )
+                dist_b = np.sqrt(
+                    (base_x_in - base_x3_temp) ** 2 + (base_y_in - base_y3_temp) ** 2
+                )
+                keep = valid & (dist_a <= 400.0) & (dist_b <= 400.0)
+                base_x2[0 : h - 1, 0 : w - 1][keep] = base_x2_temp[keep]
+                base_y2[0 : h - 1, 0 : w - 1][keep] = base_y2_temp[keep]
+                base_x3[0 : h - 1, 0 : w - 1][keep] = base_x3_temp[keep]
+                base_y3[0 : h - 1, 0 : w - 1][keep] = base_y3_temp[keep]
 
-        x1 *= st["xs"]
-        y1 *= st["ys"]
-        xx = st["xa"] * x1 + st["ya"] * y1
-        yy = -st["ya"] * x1 + st["xa"] * y1
-        xx += RR + st["xo"]
-        yy += RR + st["yo"]
-        xx = st["in_x0"] + active_scale * xx / RR
-        yy = st["in_y0"] + active_scale * yy / RR
+        base_x *= scale_x
+        base_y *= scale_y
+        map_x_coords = angle_cos * base_x + angle_sin * base_y
+        map_y_coords = -angle_sin * base_x + angle_cos * base_y
+        map_x_coords += RR + map_units_offset_x
+        map_y_coords += RR + map_units_offset_y
+        map_x_coords = center_offset_x + active_scale * map_x_coords / RR
+        map_y_coords = center_offset_y + active_scale * map_y_coords / RR
 
-        x12 *= st["xs"]
-        y12 *= st["ys"]
-        xxa = st["xa"] * x12 + st["ya"] * y12
-        yya = -st["ya"] * x12 + st["xa"] * y12
-        xxa += RR + st["xo"]
-        yya += RR + st["yo"]
-        xxa = st["in_x0"] + active_scale * xxa / RR
-        yya = st["in_y0"] + active_scale * yya / RR
+        base_x2 *= scale_x
+        base_y2 *= scale_y
+        map_x_coords_a = angle_cos * base_x2 + angle_sin * base_y2
+        map_y_coords_a = -angle_sin * base_x2 + angle_cos * base_y2
+        map_x_coords_a += RR + map_units_offset_x
+        map_y_coords_a += RR + map_units_offset_y
+        map_x_coords_a = center_offset_x + active_scale * map_x_coords_a / RR
+        map_y_coords_a = center_offset_y + active_scale * map_y_coords_a / RR
 
-        x13 *= st["xs"]
-        y13 *= st["ys"]
-        xxb = st["xa"] * x13 + st["ya"] * y13
-        yyb = -st["ya"] * x13 + st["xa"] * y13
-        xxb += RR + st["xo"]
-        yyb += RR + st["yo"]
-        xxb = st["in_x0"] + active_scale * xxb / RR
-        yyb = st["in_y0"] + active_scale * yyb / RR
+        base_x3 *= scale_x
+        base_y3 *= scale_y
+        map_x_coords_b = angle_cos * base_x3 + angle_sin * base_y3
+        map_y_coords_b = -angle_sin * base_x3 + angle_cos * base_y3
+        map_x_coords_b += RR + map_units_offset_x
+        map_y_coords_b += RR + map_units_offset_y
+        map_x_coords_b = center_offset_x + active_scale * map_x_coords_b / RR
+        map_y_coords_b = center_offset_y + active_scale * map_y_coords_b / RR
 
-        xxa -= xx
-        yya -= yy
-        xxb -= xx
-        yyb -= yy
+        map_x_coords_a -= map_x_coords
+        map_y_coords_a -= map_y_coords
+        map_x_coords_b -= map_x_coords
+        map_y_coords_b -= map_y_coords
 
-        map_mo_x = xx.astype(np.float32)
-        map_mo_y = yy.astype(np.float32)
-        map_m2_x = (xx + xxa / 2.0).astype(np.float32)
-        map_m2_y = (yy + yya / 2.0).astype(np.float32)
-        map_m3_x = (xx - xxa / 2.0).astype(np.float32)
-        map_m3_y = (yy - yya / 2.0).astype(np.float32)
-        map_m4_x = (xx + xxb / 2.0).astype(np.float32)
-        map_m4_y = (yy + yyb / 2.0).astype(np.float32)
-        map_m5_x = (xx - xxb / 2.0).astype(np.float32)
-        map_m5_y = (yy - yyb / 2.0).astype(np.float32)
+        map_mo_x = map_x_coords.astype(np.float32)
+        map_mo_y = map_y_coords.astype(np.float32)
+        map_m2_x = (map_x_coords + map_x_coords_a / 2.0).astype(np.float32)
+        map_m2_y = (map_y_coords + map_y_coords_a / 2.0).astype(np.float32)
+        map_m3_x = (map_x_coords - map_x_coords_a / 2.0).astype(np.float32)
+        map_m3_y = (map_y_coords - map_y_coords_a / 2.0).astype(np.float32)
+        map_m4_x = (map_x_coords + map_x_coords_b / 2.0).astype(np.float32)
+        map_m4_y = (map_y_coords + map_y_coords_b / 2.0).astype(np.float32)
+        map_m5_x = (map_x_coords - map_x_coords_b / 2.0).astype(np.float32)
+        map_m5_y = (map_y_coords - map_y_coords_b / 2.0).astype(np.float32)
 
-        map_m2b_x = (xx + (xxa + xxb) / 2.0).astype(np.float32)
-        map_m2b_y = (yy + (yya + yyb) / 2.0).astype(np.float32)
-        map_m3b_x = (xx + (xxa - xxb) / 2.0).astype(np.float32)
-        map_m3b_y = (yy + (yya - yyb) / 2.0).astype(np.float32)
-        map_m4b_x = (xx - (xxa + xxb) / 2.0).astype(np.float32)
-        map_m4b_y = (yy - (yya + yyb) / 2.0).astype(np.float32)
-        map_m5b_x = (xx - (xxa - xxb) / 2.0).astype(np.float32)
-        map_m5b_y = (yy - (yya - yyb) / 2.0).astype(np.float32)
+        map_m2b_x = (map_x_coords + (map_x_coords_a + map_x_coords_b) / 2.0).astype(
+            np.float32
+        )
+        map_m2b_y = (map_y_coords + (map_y_coords_a + map_y_coords_b) / 2.0).astype(
+            np.float32
+        )
+        map_m3b_x = (map_x_coords + (map_x_coords_a - map_x_coords_b) / 2.0).astype(
+            np.float32
+        )
+        map_m3b_y = (map_y_coords + (map_y_coords_a - map_y_coords_b) / 2.0).astype(
+            np.float32
+        )
+        map_m4b_x = (map_x_coords - (map_x_coords_a + map_x_coords_b) / 2.0).astype(
+            np.float32
+        )
+        map_m4b_y = (map_y_coords - (map_y_coords_a + map_y_coords_b) / 2.0).astype(
+            np.float32
+        )
+        map_m5b_x = (map_x_coords - (map_x_coords_a - map_x_coords_b) / 2.0).astype(
+            np.float32
+        )
+        map_m5b_y = (map_y_coords - (map_y_coords_a - map_y_coords_b) / 2.0).astype(
+            np.float32
+        )
 
-        mo = self._remap_sample(
+        sample_mo = self._remap_sample(
             in_arr, map_mo_x, map_mo_y, interp=cv2.INTER_LINEAR
         ).astype(np.float64)
-        m2 = self._remap_sample(
+        sample_m2 = self._remap_sample(
             in_arr, map_m2_x, map_m2_y, interp=cv2.INTER_LINEAR
         ).astype(np.float64)
-        m3 = self._remap_sample(
+        sample_m3 = self._remap_sample(
             in_arr, map_m3_x, map_m3_y, interp=cv2.INTER_LINEAR
         ).astype(np.float64)
-        m4 = self._remap_sample(
+        sample_m4 = self._remap_sample(
             in_arr, map_m4_x, map_m4_y, interp=cv2.INTER_LINEAR
         ).astype(np.float64)
-        m5 = self._remap_sample(
+        sample_m5 = self._remap_sample(
             in_arr, map_m5_x, map_m5_y, interp=cv2.INTER_LINEAR
         ).astype(np.float64)
-        m2b = self._remap_sample(
+        sample_m2b = self._remap_sample(
             in_arr, map_m2b_x, map_m2b_y, interp=cv2.INTER_LINEAR
         ).astype(np.float64)
-        m3b = self._remap_sample(
+        sample_m3b = self._remap_sample(
             in_arr, map_m3b_x, map_m3b_y, interp=cv2.INTER_LINEAR
         ).astype(np.float64)
-        m4b = self._remap_sample(
+        sample_m4b = self._remap_sample(
             in_arr, map_m4b_x, map_m4b_y, interp=cv2.INTER_LINEAR
         ).astype(np.float64)
-        m5b = self._remap_sample(
+        sample_m5b = self._remap_sample(
             in_arr, map_m5b_x, map_m5b_y, interp=cv2.INTER_LINEAR
         ).astype(np.float64)
 
-        def pre_rgb(mat):
-            return (
-                mat[..., 0] * mat[..., 3],
-                mat[..., 1] * mat[..., 3],
-                mat[..., 2] * mat[..., 3],
-                mat[..., 3],
-            )
-
-        mo_rp, mo_gp, mo_bp, mo_ap = pre_rgb(mo)
-        m2_rp, m2_gp, m2_bp, m2_ap = pre_rgb(m2)
-        m3_rp, m3_gp, m3_bp, m3_ap = pre_rgb(m3)
-        m4_rp, m4_gp, m4_bp, m4_ap = pre_rgb(m4)
-        m5_rp, m5_gp, m5_bp, m5_ap = pre_rgb(m5)
-        m2b_rp, m2b_gp, m2b_bp, m2b_ap = pre_rgb(m2b)
-        m3b_rp, m3b_gp, m3b_bp, m3b_ap = pre_rgb(m3b)
-        m4b_rp, m4b_gp, m4b_bp, m4b_ap = pre_rgb(m4b)
-        m5b_rp, m5b_gp, m5b_bp, m5b_ap = pre_rgb(m5b)
+        sample_mo_rp, sample_mo_gp, sample_mo_bp, sample_mo_ap = self._premultiply_rgba(
+            sample_mo
+        )
+        sample_m2_rp, sample_m2_gp, sample_m2_bp, sample_m2_ap = self._premultiply_rgba(
+            sample_m2
+        )
+        sample_m3_rp, sample_m3_gp, sample_m3_bp, sample_m3_ap = self._premultiply_rgba(
+            sample_m3
+        )
+        sample_m4_rp, sample_m4_gp, sample_m4_bp, sample_m4_ap = self._premultiply_rgba(
+            sample_m4
+        )
+        sample_m5_rp, sample_m5_gp, sample_m5_bp, sample_m5_ap = self._premultiply_rgba(
+            sample_m5
+        )
+        sample_m2b_rp, sample_m2b_gp, sample_m2b_bp, sample_m2b_ap = (
+            self._premultiply_rgba(sample_m2b)
+        )
+        sample_m3b_rp, sample_m3b_gp, sample_m3b_bp, sample_m3b_ap = (
+            self._premultiply_rgba(sample_m3b)
+        )
+        sample_m4b_rp, sample_m4b_gp, sample_m4b_bp, sample_m4b_ap = (
+            self._premultiply_rgba(sample_m4b)
+        )
+        sample_m5b_rp, sample_m5b_gp, sample_m5b_bp, sample_m5b_ap = (
+            self._premultiply_rgba(sample_m5b)
+        )
 
         sum_a = (
-            4.0 * mo_ap
-            + 2.0 * (m2_ap + m3_ap + m4_ap + m5_ap)
-            + (m2b_ap + m3b_ap + m4b_ap + m5b_ap)
+            4.0 * sample_mo_ap
+            + 2.0 * (sample_m2_ap + sample_m3_ap + sample_m4_ap + sample_m5_ap)
+            + (sample_m2b_ap + sample_m3b_ap + sample_m4b_ap + sample_m5b_ap)
         )
         sum_r = (
-            4.0 * mo_rp
-            + 2.0 * (m2_rp + m3_rp + m4_rp + m5_rp)
-            + (m2b_rp + m3b_rp + m4b_rp + m5b_rp)
+            4.0 * sample_mo_rp
+            + 2.0 * (sample_m2_rp + sample_m3_rp + sample_m4_rp + sample_m5_rp)
+            + (sample_m2b_rp + sample_m3b_rp + sample_m4b_rp + sample_m5b_rp)
         )
         sum_g = (
-            4.0 * mo_gp
-            + 2.0 * (m2_gp + m3_gp + m4_gp + m5_gp)
-            + (m2b_gp + m3b_gp + m4b_gp + m5b_gp)
+            4.0 * sample_mo_gp
+            + 2.0 * (sample_m2_gp + sample_m3_gp + sample_m4_gp + sample_m5_gp)
+            + (sample_m2b_gp + sample_m3b_gp + sample_m4b_gp + sample_m5b_gp)
         )
         sum_b = (
-            4.0 * mo_bp
-            + 2.0 * (m2_bp + m3_bp + m4_bp + m5_bp)
-            + (m2b_bp + m3b_bp + m4b_bp + m5b_bp)
+            4.0 * sample_mo_bp
+            + 2.0 * (sample_m2_bp + sample_m3_bp + sample_m4_bp + sample_m5_bp)
+            + (sample_m2b_bp + sample_m3b_bp + sample_m4b_bp + sample_m5b_bp)
         )
 
         eps = 1e-8
@@ -553,13 +665,31 @@ class Render:
         self.out_arr[..., :3] = np.clip(out[..., :3], 0, 255).astype(np.uint8)
 
     def getCloud(self, inp: Input, cloud: List[CloudPoint]):
+        """
+        Extract cloud points from the input image based on the mapping.
+
+        Args:
+            inp: Input object containing image and mapping parameters.
+            cloud: List to append extracted CloudPoint objects.
+
+        Returns:
+            None. Modifies `cloud` in-place.
+        """
         if self.mapping is None:
             self.logger.warning(
                 "getCloud called before pre() or with invalid mapping, skipping"
             )
             return
-        st = self._prepare_input_state(inp)
-        active_scale = st["in_scale"] / 2.0
+        scale_x = float(inp.scale[0])
+        scale_y = float(inp.scale[1])
+        angle_cos = float(inp.angle_cos)
+        angle_sin = float(inp.angle_sin)
+        input_map_size = float(inp.map_size[0])
+        center_offset_x = float(inp.center_offset[0])
+        center_offset_y = float(inp.center_offset[1])
+        map_units_offset_x = float(inp.map_units_offset[0])
+        map_units_offset_y = float(inp.map_units_offset[1])
+        active_scale = input_map_size / 2.0
         off = (self.mapping.map2_data.size[1] - self.mapping.light_data.size[1]) // 2
         if self.mapping.map1_data.size[0] < self.mapping.light_data.size[0]:
             self.logger.warning(
@@ -583,16 +713,16 @@ class Render:
         mod = mp[..., 2]
         ymod = mod // 16
         xmod = mod % 16
-        x1 = (mp[..., 0] + 256 * xmod - RR).astype(np.float64)
-        y1 = (mp[..., 1] + 256 * ymod - RR).astype(np.float64)
-        x1 *= st["xs"]
-        y1 *= st["ys"]
-        xx = st["xa"] * x1 + st["ya"] * y1
-        yy = -st["ya"] * x1 + st["xa"] * y1
-        xx += RR + st["xo"]
-        yy += RR + st["yo"]
-        xx = st["in_x0"] + active_scale * xx / RR
-        yy = st["in_y0"] + active_scale * yy / RR
+        base_x = (mp[..., 0] + 256 * xmod - RR).astype(np.float64)
+        base_y = (mp[..., 1] + 256 * ymod - RR).astype(np.float64)
+        base_x *= scale_x
+        base_y *= scale_y
+        map_x_coords = angle_cos * base_x + angle_sin * base_y
+        map_y_coords = -angle_sin * base_x + angle_cos * base_y
+        map_x_coords += RR + map_units_offset_x
+        map_y_coords += RR + map_units_offset_y
+        map_x_coords = center_offset_x + active_scale * map_x_coords / RR
+        map_y_coords = center_offset_y + active_scale * map_y_coords / RR
 
         sel_nonzero = sel[..., 0] != 0
         act_mask = mp[..., 3] > 25
@@ -607,14 +737,34 @@ class Render:
         ys, xs = np.where(mask)
         for ry, rx in zip(ys, xs):
             cloud.append(
-                CloudPoint(int(sel[ry, rx, 0]), float(xx[ry, rx]), float(yy[ry, rx]))
+                CloudPoint(
+                    int(sel[ry, rx, 0]),
+                    float(map_x_coords[ry, rx]),
+                    float(map_y_coords[ry, rx]),
+                )
             )
 
     def auto_zoom(self, inp: Input) -> bool:
+        """Determine whether to auto-zoom an input based on mapped coordinates.
+
+        Args:
+            inp: Input to evaluate.
+
+        Returns:
+            True if `inp.scale` was updated (zoomed), False otherwise.
+        """
         if self.mapping is None:
             return False
-        st = self._prepare_input_state(inp)
-        active_scale = st["in_scale"] / 2.0
+        scale_x = float(inp.scale[0])
+        scale_y = float(inp.scale[1])
+        angle_cos = float(inp.angle_cos)
+        angle_sin = float(inp.angle_sin)
+        input_map_size = float(inp.map_size[0])
+        center_offset_x = float(inp.center_offset[0])
+        center_offset_y = float(inp.center_offset[1])
+        map_units_offset_x = float(inp.map_units_offset[0])
+        map_units_offset_y = float(inp.map_units_offset[1])
+        active_scale = input_map_size / 2.0
         off = (self.mapping.map2_data.size[1] - self.mapping.light_data.size[1]) // 2
         if self.mapping.map1_data.size[0] < self.mapping.light_data.size[0]:
             self.logger.warning(
@@ -634,22 +784,22 @@ class Render:
         mod = mp[..., 2]
         ymod = mod // 16
         xmod = mod % 16
-        x1 = (mp[..., 0] + 256 * xmod - RR).astype(np.float64)
-        y1 = (mp[..., 1] + 256 * ymod - RR).astype(np.float64)
-        x1 *= st["xs"]
-        y1 *= st["ys"]
-        xx = st["xa"] * x1 + st["ya"] * y1
-        yy = -st["ya"] * x1 + st["xa"] * y1
-        xx += RR + st["xo"]
-        yy += RR + st["yo"]
-        xx = st["in_x0"] + active_scale * xx / RR
-        yy = st["in_y0"] + active_scale * yy / RR
+        base_x = (mp[..., 0] + 256 * xmod - RR).astype(np.float64)
+        base_y = (mp[..., 1] + 256 * ymod - RR).astype(np.float64)
+        base_x *= scale_x
+        base_y *= scale_y
+        map_x_coords = angle_cos * base_x + angle_sin * base_y
+        map_y_coords = -angle_sin * base_x + angle_cos * base_y
+        map_x_coords += RR + map_units_offset_x
+        map_y_coords += RR + map_units_offset_y
+        map_x_coords = center_offset_x + active_scale * map_x_coords / RR
+        map_y_coords = center_offset_y + active_scale * map_y_coords / RR
 
         mask = (sel[..., 0] == 1) & (mp[..., 3] > 25)
         if not mask.any():
             return False
-        y_min = float(np.min(yy[mask]))
-        y_max = float(np.max(yy[mask]))
+        y_min = float(np.min(map_y_coords[mask]))
+        y_max = float(np.max(map_y_coords[mask]))
 
         hh = inp.image.height
         if (y_max - y_min) < (hh * 0.75):
@@ -665,6 +815,18 @@ class Render:
         w: int = -1,
         h: int = -1,
     ) -> Image.Image:
+        """
+        Apply the mapping and render the output image, optionally scaling to fit within (w, h).
+
+        Args:
+            frame_index: Index of the current frame being rendered.
+            template: Template containing mapping and rendering settings.
+            inputs: List of Input objects to render.
+            w: Desired output width. If -1, use original width.
+            h: Desired output height. If -1, use original height.
+        Returns:
+            A PIL Image object containing the rendered output, scaled to fit within (w, h)
+        """
         self.pre(frame_index, template)
         mapping = self.mapping
         if mapping is None:
@@ -707,3 +869,22 @@ class Render:
             self.out_arr = np.array(out_scaled)
             return out_scaled
         return Image.fromarray(self.out_arr, mode="RGBA")
+
+    def _premultiply_rgba(
+        self, mat: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Premultiplies the RGBA values of a matrix.
+
+        Args:
+            mat: A numpy array of shape (..., 4) representing RGBA values.
+
+        Returns:
+            A tuple of four numpy arrays representing the premultiplied R, G, B, and A channels, respectively.
+        """
+        return (
+            mat[..., 0] * mat[..., 3],
+            mat[..., 1] * mat[..., 3],
+            mat[..., 2] * mat[..., 3],
+            mat[..., 3],
+        )

@@ -14,7 +14,9 @@ class Input:
         theta: float = 0,
     ):
         self.path = path
-        self.image = Image.open(self.path)
+        img = Image.open(self.path)
+        img.load()
+        self.image = img.copy()
         self.layer = layer
         self.scale = scale
         self.offset = offset
