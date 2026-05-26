@@ -207,6 +207,15 @@ class Template:
             hold=config_dict.get("hold", 0.0),
         )
 
+    def remove_frame(self, index: int):
+        for i, frame in enumerate(self.frames):
+            if frame.number == index:
+                del self.frames[i]
+                return
+        self.logger.warning(
+            f"Attempted to remove non-existent frame {index} from template"
+        )
+
     def _parse_value(self, value_str: str):
         if value_str.startswith("[") and value_str.endswith("]"):
             return [int(x.strip()) for x in value_str[1:-1].split(",")]

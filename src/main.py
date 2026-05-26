@@ -40,6 +40,18 @@ def main():
         if start_frame > end_frame:
             logger.panic("First frame cannot be greater than last frame")
 
+        removed_frames: list[int] = []
+        for i in range(0, start_frame):
+            removed_frames.append(i)
+            template.remove_frame(i)
+        for i in range(end_frame + 1, template.config.frames):
+            removed_frames.append(i)
+            template.remove_frame(i)
+        logger.debug(
+            f"Removed frames outside of range [{start_frame}, {end_frame}]; removed frames: {removed_frames}"
+        )
+        removed_frames_time = time()
+
         renders = Renders(
             template,
             inputs,
@@ -48,18 +60,6 @@ def main():
             logger=logger,
         )
         constructed_renders_time = time()
-
-        removed_frames: list[int] = []
-        for i in range(0, start_frame):
-            removed_frames.append(i)
-            renders.remove_render(i)
-        for i in range(end_frame + 1, template.config.frames):
-            removed_frames.append(i)
-            renders.remove_render(i)
-        logger.debug(
-            f"Constructed renders object and removed frames outside of range [{start_frame}, {end_frame}]; removed frames: {removed_frames}"
-        )
-        removed_frames_time = time()
 
         if args.auto_zoom:
             renders.auto_zoom()
@@ -89,16 +89,16 @@ def main():
             logger.info(
                 f"Time to load inputs: {loaded_inputs_time - loaded_template_time:.2f} seconds"
             )
-            logger.info(
-                f"Time to construct renders: {constructed_renders_time - loaded_inputs_time:.2f} seconds"
-            )
             if removed_frames:
                 logger.info(
-                    f"Time to remove frames: {removed_frames_time - constructed_renders_time:.2f} seconds"
+                    f"Time to remove frames: {removed_frames_time - loaded_inputs_time:.2f} seconds"
                 )
+            logger.info(
+                f"Time to construct renders: {constructed_renders_time - removed_frames_time:.2f} seconds"
+            )
             if args.auto_zoom:
                 logger.info(
-                    f"Time for auto-zoom: {auto_zoom_time - removed_frames_time:.2f} seconds"
+                    f"Time for auto-zoom: {auto_zoom_time - constructed_renders_time:.2f} seconds"
                 )
             if args.gif_path:
                 logger.info(
